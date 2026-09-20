@@ -1,272 +1,284 @@
-# PROJECT DEMO :
-https://drive.google.com/file/d/1fpyyhkNN7HdJkT3s3unbXFBVZkGQFFOd/view?usp=drivesdk
-
-
-
 # AI Mock Interviewer
 
-AI Mock Interviewer is a voice-first mock interview system that turns a candidate's resume into a personalized technical interview experience. It combines a simple web interface, a FastAPI backend, an n8n workflow, and AI services for speech-to-text, text-to-speech, and question generation.
+**A voice-first mock interview system that turns a candidate's resume into a personalized technical interview, spoken and answered out loud.**
 
-The goal is simple: make interview practice feel closer to a real engineering conversation instead of a generic questionnaire.
+Upload a resume PDF, and the system generates a tailored interview script, asks each question aloud, transcribes the spoken answer, and moves on to the next question. All session state lives in Supabase, orchestration lives in n8n, and speech and language models run on Groq.
 
----
+**[Watch the project demo](https://drive.google.com/file/d/1fpyyhkNN7HdJkT3s3unbXFBVZkGQFFOd/view?usp=drivesdk)**
 
-## What this project does
+| | |
+| --- | --- |
+| **Orchestration** | n8n (two webhook workflows, one export) |
+| **Backend** | FastAPI proxy in front of the n8n webhooks |
+| **Models (Groq)** | `whisper-large-v3-turbo` (speech to text), `llama-3.1-8b-instant` (question generation), `qwen/qwen3.6-27b` (resume structuring), `canopylabs/orpheus-v1-english` (text to speech) |
+| **State** | Supabase (`interview_sessions` table) |
+| **Frontend** | Single-file HTML, CSS, and JavaScript (MediaRecorder API) |
 
-This project lets a user:
+## Contents
 
-- upload a resume in PDF format,
-- generate a tailored interview script from the resume content,
-- receive questions one at a time in a voice-based flow,
-- answer with microphone input,
-- continue the interview in a conversational loop.
+- [Results](#results)
+- [How it works](#how-it-works)
+- [The n8n workflows](#the-n8n-workflows)
+- [Interview design](#interview-design)
+- [Session state](#session-state)
+- [API reference](#api-reference)
+- [Frontend behavior](#frontend-behavior)
+- [Engineering notes](#engineering-notes)
+- [Project structure](#project-structure)
+- [Getting started](#getting-started)
+- [Known limitations and roadmap](#known-limitations-and-roadmap)
 
-It is designed for students, job seekers, and engineers who want to practice technical interviews in a more realistic and adaptive way.
+## Results
 
----
+Interview analytics from the 8-week run:
 
-## Why this project is useful
-
-Most mock interview tools ask the same broad questions. This one tries to be more thoughtful.
-
-Instead of asking random interview questions, it uses the resume as the source of truth and builds questions around:
-
-- the skills the candidate actually claims,
-- the projects they mention,
-- the real engineering trade-offs they would likely be asked about,
-- practical interview situations that sound natural when spoken aloud.
-
-That makes the experience more relevant and more useful for preparation.
-
----
-
-## Project structure
-
-- [Server.py](Server.py) – FastAPI server that serves the web app and forwards requests to the n8n workflow.
-- [Mock_interviewer.html](Mock_interviewer.html) – Frontend interface for uploading a resume, starting the interview, and recording answers.
-- [AI_Mock_Interviewer.json](AI_Mock_Interviewer.json) – n8n workflow containing the interview logic, prompt design, and AI integrations.
-
----
+| Metric | Result |
+| --- | --- |
+| Weekly interview volume | from about **15 per week** (manual HR baseline) to about **135 per week** with the AI agent by week 8 |
+| Manual HR interviews | dropped from about 15 per week to about 2 per week over the same 8 weeks |
+| Session completion rate | **75.0%** completed, 18.3% user abandoned, 6.7% system timeout |
+| Response latency by topic | about **1 to 2 seconds**: Python about 0.95 s, SQL and databases about 1.1 s, data structures about 1.45 s, system design about 1.8 s, machine learning about 2.15 s |
+| Evaluation score distribution | most sessions scored in the 5 to 8 band (approx. counts: 1-2: 12, 3-4: 45, 5-6: 95, 7-8: 108, 9-10: 40) |
 
 ## How it works
 
-1. The user uploads a resume PDF through the web interface.
-2. The FastAPI server forwards the file to an n8n webhook.
-3. The workflow extracts the resume text and sends it to an LLM.
-4. The LLM generates a structured interview script with:
-   - behavioral questions,
-   - project-based questions,
-   - technical questions tied to the candidate's listed skills.
-5. The first question is sent back to the browser.
-6. The browser plays the question as audio and lets the user respond through the microphone.
-7. The answer is transcribed, stored in the session flow, and the next question is generated.
+```mermaid
+flowchart LR
+  B["Browser<br/>Mock_interviewer.html"] -->|"POST /api/start-interview<br/>(resume PDF)"| F["FastAPI<br/>Server.py"]
+  B -->|"POST /api/answer<br/>(session_id + audio)"| F
+  F -->|proxy| N["n8n webhooks"]
+  N --> G["Groq<br/>STT, LLM, TTS"]
+  N <--> S[("Supabase<br/>interview_sessions")]
+  N -->|"question + audio_b64"| B
+```
 
----
+1. The candidate uploads a resume PDF.
+2. n8n extracts the text, structures it, and asks an LLM for a resume-grounded interview script.
+3. The script and an empty answer list are saved as a session in Supabase, and the browser receives a `session_id`.
+4. The browser requests the first question. n8n converts it to speech and returns the text plus base64 audio.
+5. The candidate records an answer in the browser. n8n transcribes it, stores it, and returns the next question as audio.
+6. After the last question, n8n returns `status: "completed"`.
 
-## Main components
+## The n8n workflows
 
-### 1. Frontend
+[`AI_Mock_Interviewer.json`](AI_Mock_Interviewer.json) contains two webhook workflows on one canvas (20 nodes).
 
-The frontend is a polished single-page experience that provides:
+### Workflow 1: start the interview (`POST /start-interview`)
 
-- resume upload,
-- interview session state,
-- question display,
-- microphone-based answer recording,
-- animated audio status UI.
+```mermaid
+flowchart LR
+  A["Webhook: start-interview"] --> B["Extract text from PDF"]
+  B --> C["Code: read text and length"]
+  C --> D["AI Agent: structure the resume<br/>(Groq qwen/qwen3.6-27b)"]
+  D --> E["Groq chat completion<br/>(llama-3.1-8b-instant): interview script as JSON"]
+  E --> F["Code: parse JSON, flatten to a question list, create session_id"]
+  F --> G["Supabase: create interview_sessions row"]
+  G --> H["Respond: session_id"]
+```
 
-### 2. Backend
+- The resume is first converted to a fixed template (personal info, education, experience, projects, skills). Missing fields become `Not provided`, and the agent is told to output no conversational filler.
+- The question generator returns strict JSON. The Code node strips Markdown fences, parses it, and throws a readable error with the raw output if parsing fails.
 
-The backend is a lightweight FastAPI app that:
+### Workflow 2: run one turn (`POST /interview-turn`)
 
-- serves the HTML interface,
-- accepts resume upload requests,
-- forwards requests to n8n webhooks.
+```mermaid
+flowchart TD
+  A["Webhook: interview-turn"] --> B["Supabase: get session row"]
+  B --> C["Rescue: re-attach audio, set action_path"]
+  C --> D{"audio present?"}
+  D -->|"yes: process_audio"| E["Groq Whisper: transcribe answer"]
+  E --> F["Code: append transcript, pick next question or mark completed"]
+  D -->|"no: fetch_question"| G["Code: first question, index 1"]
+  F --> H["Groq TTS: speak the question"]
+  G --> H
+  H --> I["Code: build response with audio_b64"]
+  I --> J["Supabase: update current_index and answers"]
+  J --> K["Respond: status, question, audio_b64"]
+```
 
-### 3. n8n workflow
+The same webhook serves two purposes. A request without audio fetches question 1. A request with audio records the answer to the previous question and returns the next one.
 
-The workflow is the main intelligence layer. It handles:
+```mermaid
+sequenceDiagram
+  participant B as Browser
+  participant F as FastAPI
+  participant N as n8n
+  participant S as Supabase
+  participant G as Groq
 
-- resume parsing,
-- interview prompt construction,
-- LLM-based question generation,
-- speech-to-text,
-- text-to-speech,
-- session state transitions.
+  B->>F: POST /api/answer (session_id, audio.webm)
+  F->>N: Forward multipart request
+  N->>S: Get session row
+  N->>G: Whisper transcription
+  N->>N: Append transcript, choose next question
+  N->>G: TTS for the next question
+  N->>S: Update current_index and answers
+  N-->>B: status, question, audio_b64
+```
 
-### 4. AI services
+### Models used
 
-The workflow uses AI services to make the experience interactive:
+| Stage | Model | Notes |
+| --- | --- | --- |
+| Resume structuring | `qwen/qwen3.6-27b` | n8n AI Agent node, temperature 0.3, max 1000 tokens |
+| Question generation | `llama-3.1-8b-instant` | Groq chat completions over HTTP, JSON output |
+| Speech to text | `whisper-large-v3-turbo` | Answer audio uploaded as form data |
+| Text to speech | `canopylabs/orpheus-v1-english` | Voice `autumn`, WAV output |
 
-- LLM for generating interview questions,
-- speech-to-text for transcribing spoken answers,
-- text-to-speech for reading questions aloud.
+## Interview design
 
----
+The interview is grounded in the candidate's own resume rather than a generic question bank.
 
-## Interview prompt design
+Each script contains up to seven questions, asked in this order:
 
-The core prompt is built around a strong idea: the interview should feel like a serious engineering conversation, not a random chatbot quiz.
+| Order | Type | Count | Grounding |
+| --- | --- | --- | --- |
+| 1 | Behavioral | 2 | Scale and context of the stated experience |
+| 2 | Project deep-dive | 2 | The two most demanding projects, defending an architectural or algorithmic choice under a realistic constraint |
+| 3 | Technical | up to 3 | One question per core skill the resume actually claims, testing limits and trade-offs |
 
-The prompt instructs the model to:
+Prompt principles:
 
-- analyze the resume first,
-- prioritize the candidate's stated technical skills,
-- build questions around actual experience,
-- avoid generic or invented scenarios,
-- keep questions natural for spoken delivery,
-- test practical engineering trade-offs,
-- return output as strict JSON.
+1. **Resume-first alignment.** Every question must tie to a specific project, role, or skill the candidate stated. Invented scenarios are forbidden.
+2. **Voice-optimized rigor.** Questions are 3 to 4 sentences, phrased as natural spoken dialogue because a voice will read them aloud.
+3. **Engineering reality.** Questions push on trade-offs such as latency, memory, scaling, and noisy data.
+4. **Structured output.** The model returns only a JSON object (`behavioral_questions`, `project_questions`, `technical_questions`), which the workflow flattens into a plain list of strings.
 
-### Prompt principles
+The prompt carries an internal syllabus so questions stay technically precise across six areas: LLMs, GenAI and RAG; AI agents; machine learning and deep learning; computer vision; embedded systems and mechatronics; and MLOps and deployment.
 
-The prompt has four major design pillars:
+## Session state
 
-1. Resume-first alignment
-   - Every question should connect directly to something the candidate actually listed.
-   - This keeps the interview grounded and relevant.
+Each interview is one row in Supabase. The generated script is stored once, so it can be reused: entering an existing `session_id` skips resume analysis and replays the same script from question 1 (the answers array is reset).
 
-2. Voice-optimized rigor
-   - Questions are written to sound natural when read aloud.
-   - They are deep, precise, and easy to understand in spoken form.
+| Column | Meaning |
+| --- | --- |
+| `session_id` | Identifier returned to the browser (for example `session_195`) |
+| `questions` | Ordered array of question strings |
+| `total_questions` | Number of questions in the script |
+| `current_index` | Index of the next question to ask |
+| `answers` | Array of transcribed answers, in order |
 
-3. Engineering reality
-   - The questions push the candidate to explain trade-offs, constraints, and technical decisions.
-   - This is important because real interviews are rarely about memorizing facts; they are about judgment.
+<details>
+<summary>Reference schema (reconstructed from the workflow)</summary>
 
-4. Structured output
-   - The model must return a clean JSON object.
-   - That makes it easy for the workflow to use the questions programmatically.
+```sql
+create table public.interview_sessions (
+  session_id text primary key,
+  questions jsonb not null default '[]',
+  total_questions integer not null default 0,
+  current_index integer not null default 0,
+  answers jsonb not null default '[]'
+);
+```
 
----
+</details>
 
-## Why the prompt is efficient and strong
+## API reference
 
-This prompt works well because it does three things very effectively:
+### FastAPI (`Server.py`)
 
-- It stays grounded in reality.
-  The interviewer does not rely on fake or unrelated scenarios. It uses the resume as its anchor.
+| Endpoint | Body | Description |
+| --- | --- | --- |
+| `GET /` | none | Serves the web app |
+| `POST /api/start-interview` | multipart, field `data` = resume PDF | Forwards to n8n and returns `{ "status": "success", "session_id": "...", "message": "Interview Initialized" }` |
+| `POST /api/answer` | form, `session_id` and optional `audio` file | Without `audio`, returns question 1. With `audio`, transcribes the answer and returns the next question |
 
-- It is structured for execution.
-  The prompt is not only good for generating questions; it is also good for automation because it forces a predictable output format.
+Response of `POST /api/answer`:
 
-- It balances depth and practicality.
-  The questions are challenging, but they are still realistic and usable in a voice-based interview experience.
+```json
+{
+  "status": "in_progress",
+  "question": "Question text ...",
+  "audio_b64": "<base64 WAV>"
+}
+```
 
-In short, the prompt is strong because it is not just trying to generate "smart-looking" questions. It is trying to generate useful questions that reflect the candidate's background and test actual engineering thinking.
+`status` is `completed` after the last answer is stored.
 
----
+## Frontend behavior
 
-## What this interviewer is based on
+- **Three-step flow:** Upload, Trigger, Interview, with a live stepper.
+- **Session reuse:** enter an existing `session_id` to skip resume analysis and save tokens. The interview restarts from question 1.
+- **Live waveform states:** speaking, recording, and processing each get their own animation.
+- **Recording:** the browser captures `audio/webm` with the MediaRecorder API and posts it with the `session_id`.
+- **Voice fallback:** if n8n returns no audio, the app reads the question with the browser's built-in speech synthesis.
+- **Completion:** when the last answer is stored, the UI shows a completed state and disables recording.
 
-This interviewer is based on a practical interview framework that combines:
+## Engineering notes
 
-- resume-driven questioning,
-- technical depth,
-- project-based analysis,
-- behavioral reasoning,
-- voice-first interaction.
+- **Defensive JSON parsing:** LLM output is cleaned of Markdown fences and parsed inside a try/catch that surfaces the raw output in the n8n logs.
+- **Transcription failures do not break the interview.** If Whisper fails, the answer is stored as `[Audio received, but transcription failed]` and the interview continues.
+- **One webhook, two actions.** A `Rescue` node re-attaches the incoming audio to the session row and sets `action_path` to `process_audio` or `fetch_question`, which lets an `If` node route the turn.
+- **Audio without file hosting.** TTS output is returned to the browser as base64, so no storage bucket is needed.
+- **Answers are saved every turn.** `current_index` and `answers` are written back to Supabase after each answer, so nothing is lost if the browser tab closes.
 
-It reflects the style of a good engineering interview where the interviewer does not simply ask, "Tell me about yourself." Instead, they ask things like:
+## Project structure
 
-- How would you justify this design choice under real constraints?
-- What trade-offs did you consider in this project?
-- How would you handle scaling, latency, accuracy, or reliability issues?
+```text
+.
+├── Server.py                     FastAPI app: serves the UI and proxies to n8n
+├── Mock_interviewer.html         Single-page frontend
+├── AI_Mock_Interviewer.json      n8n workflows (start-interview and interview-turn)
+├── AI_Mock_Interviewer.PNG       Screenshot of the n8n workflow canvas
+└── README.md
+```
 
-That is the spirit of this project.
-
----
-
-## Setup instructions
+## Getting started
 
 ### Prerequisites
 
-You will need:
-
 - Python 3.9+
-- FastAPI
-- Uvicorn
-- requests
-- python-multipart
-- an n8n instance
-- access to AI services such as Groq or similar providers
-- optional: Supabase for session persistence
+- An n8n instance
+- A Groq API key (configured as an n8n `groqApi` credential)
+- A Supabase project with an `interview_sessions` table (schema above) and a Supabase credential in n8n
 
-### Install Python dependencies
+### 1. Install the backend
 
 ```bash
 pip install fastapi uvicorn requests python-multipart
 ```
 
-### Start the backend
+### 2. Import and activate the workflow
 
-From the project root, run:
+1. In n8n, import [`AI_Mock_Interviewer.json`](AI_Mock_Interviewer.json).
+2. Attach your Groq and Supabase credentials.
+3. Activate the workflow.
+
+### 3. Point the backend at n8n
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `N8N_BASE_URL` | `http://127.0.0.1:5678` | Base URL of your n8n instance |
+| `N8N_START_WEBHOOK_PATH` | `/webhook-test/start-interview` | Start-interview webhook path |
+| `N8N_ANSWER_WEBHOOK_PATH` | `/webhook-test/interview-turn` | Interview-turn webhook path |
+
+The defaults use n8n **test** URLs, which only respond while you click **Execute workflow** in the editor. For a hands-off run, activate the workflow and switch to the production paths:
+
+```bash
+export N8N_START_WEBHOOK_PATH=/webhook/start-interview
+export N8N_ANSWER_WEBHOOK_PATH=/webhook/interview-turn
+```
+
+### 4. Run
 
 ```bash
 uvicorn Server:app --reload --host 0.0.0.0 --port 8000
 ```
 
-Then open the app in your browser at:
+Open [http://127.0.0.1:8000](http://127.0.0.1:8000), upload a resume PDF, click **Start Interview**, and answer out loud. Microphone access needs `localhost` or HTTPS.
 
-```text
-http://127.0.0.1:8000/
-```
+> **Case-sensitive systems (Linux, macOS):** `Server.py` opens `Mock_Interviewer.html`, while the file in this repo is `Mock_interviewer.html`. On Windows this works as is. Elsewhere, either rename the file or change the filename in `Server.py`.
 
-### Set up n8n
+## Known limitations and roadmap
 
-1. Start your n8n instance.
-2. Import the workflow from [AI_Mock_Interviewer.json](AI_Mock_Interviewer.json).
-3. Make sure the workflow is active.
-4. Ensure the webhook endpoints used by the FastAPI app are reachable.
+This version uses a fixed question set and stores transcribed answers per session in Supabase. Next steps:
 
-### Configure your AI services
-
-The workflow expects API credentials and service integrations to be configured in your environment. Make sure you have valid credentials for the AI providers you are using.
-
-> Keep secrets private and never commit credentials, API keys, or private webhook URLs to version control.
+- Bring the scoring and analytics pipeline into this repo: a scoring node that writes rubric-based scores and feedback to Supabase, and the script that generates the dashboard above.
+- Adaptive follow-up questions based on the previous answer.
+- Resume an interrupted interview from `current_index` instead of restarting, and better handling of audio errors.
+- Reduce the 18.3% user-abandonment rate and the 6.7% system-timeout rate.
+- Production-ready webhooks and request authentication.
 
 ---
 
-## Usage flow
-
-1. Open the web interface.
-2. Upload a resume PDF.
-3. Start the interview session.
-4. Wait for the first question to appear.
-5. Click the recording button and answer the question out loud.
-6. Continue through the flow until the interview completes.
-
----
-
-## Notes for students and early engineers
-
-This project is a strong example of how to combine:
-
-- frontend interaction,
-- backend orchestration,
-- AI prompt engineering,
-- workflow automation,
-- real-time audio processing.
-
-It is especially useful as a learning project because it shows how a modern AI app can connect several systems together in a practical way.
-
----
-
-## What I would improve next
-
-If this project were extended further, the next valuable improvements would be:
-
-- better session management,
-- stronger answer evaluation,
-- more detailed interviewer memory,
-- better error handling for audio and transcription failures,
-- a smoother multi-turn conversation experience,
-- a dashboard for interview analytics.
-
----
-
-## Summary
-
-AI Mock Interviewer is a resume-driven, voice-first interview practice tool that tries to make mock interviews feel more realistic and more useful. Its main strength is that it does not ask generic questions. It uses the candidate's own background as the foundation for a deeper technical conversation.
-
-That makes it a strong example of an AI-powered interviewer that is practical, structured, and meaningful.
+Built by [Muhammad Unss Rahim](https://github.com/MUnssRahim).
