@@ -4,7 +4,7 @@
 
 Upload a resume PDF, and the system generates a tailored interview script, asks each question aloud, transcribes the spoken answer, and moves on to the next question. All session state lives in Supabase, orchestration lives in n8n, and speech and language models run on Groq.
 
-**[Watch the project demo](https://drive.google.com/file/d/1fpyyhkNN7HdJkT3s3unbXFBVZkGQFFOd/view?usp=drivesdk)**
+**[Watch the project demo](https://youtu.be/HzrDS6J4yj8)**
 
 | | |
 | --- | --- |
